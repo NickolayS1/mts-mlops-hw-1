@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Set kafka configuration file
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 TRANSACTIONS_TOPIC = os.getenv("KAFKA_TRANSACTIONS_TOPIC", "transactions")
-SCORING_TOPIC = os.getenv("KAFKA_SCORING_TOPIC", "scoring")
+SCORING_TOPIC = os.getenv("KAFKA_SCORING_TOPIC", "scores")
 
 
 class ProcessingService:
@@ -68,12 +68,14 @@ class ProcessingService:
                 # Добавляем ID в результат
                 submission['transaction_id'] = transaction_id
 
-                # Отправка результата в топик scoring
+                # Отправка результата в топик scores
                 self.producer.produce(
-                    'scoring',
+                    SCORING_TOPIC,
                     value=submission.to_json(orient='records')
                 )
-                self.producer.flush()
+                # Доставку сообщений выполняет librdkafka в фоне, чтобы не
+                # блокировать чтение следующего сообщения из Kafka
+                self.producer.poll(0)
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
 
@@ -85,3 +87,8 @@ if __name__ == "__main__":
         service.process_messages()
     except KeyboardInterrupt:
         logger.info('Service stopped by user')
+    finally:
+        # Выгружаем сообщения, которые ещё не были доставлены
+        service.producer.flush()
+        # Корректно выходим из consumer group
+        service.consumer.close()
