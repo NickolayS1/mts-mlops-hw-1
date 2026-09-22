@@ -1,4 +1,6 @@
 # Import standard libraries
+import json
+import os
 import pandas as pd
 import numpy as np
 import logging
@@ -9,6 +11,9 @@ from sklearn.impute import SimpleImputer
 
 logger = logging.getLogger(__name__)
 RANDOM_STATE = 42
+
+# Lookup tables derived from the competition train.csv by tools/build_encoders.py
+ENCODERS_PATH = os.getenv('ENCODERS_PATH', './models/encoders.json')
 
 def add_time_features(df):
     logger.debug('Adding time features...')
@@ -23,14 +28,15 @@ def add_time_features(df):
     return df
 
 
-def cat_encode(train, input_df, col):
+def cat_encode(encoders, input_df, col):
     
     logger.debug('Encoding category: %s', col)
     new_col = col + '_cat'
-    mapping = train[[col, new_col]].drop_duplicates()
+    mapping = encoders['category_maps'][col]
     
-    # Merge to initial dataset
-    input_df = input_df.merge(mapping, how='left', on=col).drop(columns=col)
+    # Apply the category mapping built from the training data
+    input_df[new_col] = input_df[col].map(mapping).fillna('cat_NAN')
+    input_df = input_df.drop(columns=col)
     
     return input_df
 
@@ -48,52 +54,24 @@ def add_distance_features(df):
     return df.drop(columns=['lat', 'lon', 'merchant_lat', 'merchant_lon'])
 
 
-# Calculate means for encoding at docker container start
-def load_train_data():
+# Load the precomputed encoding tables at docker container start
+def load_encoders():
 
-    logger.info('Loading training data...')
+    logger.info('Loading encoders...')
 
-    # Define column types
-    target_col = 'target'
-    categorical_cols = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
-    n_cats = 50
+    # Import the lookup tables built from the training data
+    with open(ENCODERS_PATH, encoding='utf-8') as fh:
+        encoders = json.load(fh)
 
-    # Import Train dataset
-    train = pd.read_csv('./train_data/train.csv').drop(columns=['name_1', 'name_2', 'street', 'post_code'])
-    logger.info('Raw train data imported. Shape: %s', train.shape)
+    logger.info('Encoders imported. Source rows: %s', encoders['meta']['source_rows'])
 
-    # Add some simple time features
-    train = add_time_features(train)
-
-    for col in categorical_cols:
-        new_col = col + '_cat'
-
-        # Get table of categories
-        temp_df = train\
-            .groupby(col, dropna=False)[[target_col]]\
-            .count()\
-            .sort_values(target_col, ascending=False)\
-            .reset_index()\
-            .set_axis([col, 'count'], axis=1)\
-            .reset_index()
-        temp_df['index'] = temp_df.apply(lambda x: np.nan if pd.isna(x[col]) else x['index'], axis=1)
-        temp_df[new_col] = ['cat_NAN' if pd.isna(x) else 'cat_' + str(x) if x < n_cats else f'cat_{n_cats}+' for x in temp_df['index']]
-
-        train = train.merge(temp_df[[col, new_col]], how='left', on=col)
-    
-    # Calculate distance between a client and a merchant
-    train = add_distance_features(train)
-
-    logger.info('Train data processed. Shape: %s', train.shape)
-
-    return train
+    return encoders
 
 
 # Main preprocessing function
-def run_preproc(train, input_df):
+def run_preproc(encoders, input_df):
 
     # Define column types
-    target_col = 'target'
     categorical_cols = ['gender', 'merch', 'cat_id', 'one_city', 'us_state', 'jobs']
     continuous_cols = ['amount', 'population_city']
     drop_col = ['name_1', 'name_2', 'street', 'post_code']
@@ -101,7 +79,7 @@ def run_preproc(train, input_df):
     
     # Run category encoding
     for col in categorical_cols:
-        input_df = cat_encode(train, input_df, col)
+        input_df = cat_encode(encoders, input_df, col)
 
     logger.info('Categorical merging completed. Output shape: %s', input_df.shape)
     
@@ -118,12 +96,9 @@ def run_preproc(train, input_df):
         # Fill empty values of categorical columns with some default category
         input_df[col] = input_df[col].fillna('cat_NAN')
     
-        # Create table of means
-        means_tb = train.groupby(col)[[target_col]].mean()\
-                        .reset_index().rename(columns={target_col:f'{col}_mean_enc'})
-        
-        # Join to datasets
-        input_df = input_df.merge(means_tb, how='left', on=col)
+        # Look up the target mean for every category
+        means_tb = encoders['mean_encodings'][col]
+        input_df[f'{col}_mean_enc'] = input_df[col].astype(str).map(means_tb)
 
     logger.info('Categorical mean encoding completed. Output shape: %s', input_df.shape)
 
@@ -132,8 +107,10 @@ def run_preproc(train, input_df):
     continuous_cols.extend(['distance'])
 
     # Impute empty values with mean value
-    imputer = SimpleImputer(missing_values=np.nan, strategy='mean') 
-    imputer = imputer.fit(train[continuous_cols])
+    imputer = SimpleImputer(missing_values=np.nan, strategy='mean')
+    imputer = imputer.fit(pd.DataFrame(
+        [[encoders['imputer_stats'][c] for c in continuous_cols]], columns=continuous_cols
+    ))
 
     output_df = pd.concat([
         input_df.drop(columns=continuous_cols),

@@ -9,7 +9,7 @@ from datetime import datetime
 from confluent_kafka import Consumer, Producer, KafkaError
 
 sys.path.append(os.path.abspath('./src'))
-from preprocessing import load_train_data, run_preproc
+from preprocessing import load_encoders, run_preproc
 from scorer import make_pred
 
 logging.basicConfig(
@@ -42,8 +42,8 @@ class ProcessingService:
         self.consumer.subscribe([TRANSACTIONS_TOPIC])
         self.producer = Producer(self.producer_config)
         
-        # Загрузка данных для препроцессинга
-        self.train = load_train_data()
+        # Загрузка таблиц для препроцессинга
+        self.encoders = load_encoders()
 
     def process_messages(self):
         while True:
@@ -62,7 +62,7 @@ class ProcessingService:
                 input_df = pd.DataFrame([data['data']])
 
                 # Препроцессинг и предсказание
-                processed_df = run_preproc(self.train, input_df)
+                processed_df = run_preproc(self.encoders, input_df)
                 submission = make_pred(processed_df, "kafka_stream")
 
                 # Добавляем ID в результат
