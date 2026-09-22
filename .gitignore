@@ -1,0 +1,13 @@
+# Raw competition data (download separately from Kaggle: teta-ml-1-2025)
+teta-ml-1-2025/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+*.log
+logs/
