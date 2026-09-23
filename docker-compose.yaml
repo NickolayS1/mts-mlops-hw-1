@@ -2,6 +2,7 @@ services:
   # Zookeeper (обязательный для Kafka)
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
+    restart: unless-stopped
     networks:
       - ml-scorer
     environment:
@@ -13,6 +14,7 @@ services:
   # Сервис Kafka
   kafka:
     image: confluentinc/cp-kafka:7.3.0
+    restart: unless-stopped
     depends_on:
       - zookeeper
     networks:
@@ -22,6 +24,9 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Листенеры объявляем явно, чтобы не зависеть от того,
+      # как entrypoint образа выводит их из advertised-адресов
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:9095
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9095
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
@@ -44,7 +49,6 @@ services:
     restart: on-failure
     entrypoint: [ "/bin/bash", "-c" ]
     command: |
-      "
       echo 'Ожидание готовности Kafka...'
       while ! kafka-topics --bootstrap-server kafka:9092 --list; do
         sleep 1
@@ -52,15 +56,15 @@ services:
 
       echo 'Создание топиков...'
       kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scoring --partitions 3 --replication-factor 1 --config retention.ms=604800000
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 3 --replication-factor 1 --config retention.ms=604800000
 
       echo 'Топики успешно созданы:'
       kafka-topics --bootstrap-server kafka:9092 --list
-      "
   
   # Сервис для удобного просмотра топиков и настройки kafka
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
+    restart: unless-stopped
     depends_on:
       - kafka
     networks:
@@ -74,25 +78,34 @@ services:
 
   fraud_detector:
     build: ./fraud_detector
+    restart: unless-stopped
     networks:
       - ml-scorer
     environment:
       KAFKA_BOOTSTRAP_SERVERS: "kafka:9092"
       KAFKA_TRANSACTIONS_TOPIC: "transactions"
-      KAFKA_SCORING_TOPIC: "scoring"
+      KAFKA_SCORING_TOPIC: "scores"
     depends_on:
-      - kafka
-      - kafka-setup
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully  # Топики должны существовать до старта
+    volumes:
+      - ./logs/fraud_detector:/app/logs
 
   interface:
     build: ./interface
+    restart: unless-stopped
     networks:
       - ml-scorer
     environment:
       KAFKA_BROKERS: "kafka:9092"  # Используем внутренний адрес Kafka
       KAFKA_TOPIC: "transactions"
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully  # Топики должны существовать до старта
     ports:
       - "8501:8501"
 
