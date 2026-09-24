@@ -9,13 +9,14 @@ DISCLAIMER
 ## 🏗️ Архитектура
 
 Компоненты системы:
+
 1. **`interface`** (Streamlit UI):
-   
+
    Создан для удобной симуляции потоковых данных с транзакциями. Реальный продукт использовал бы прямой поток данных из других систем.
     - Имитирует отправку транзакций в Kafka через CSV-файлы.
     - Генерирует уникальные ID для транзакций.
     - Загружает транзакции отдельными сообщениями формата JSON в топик kafka `transactions`.
-    
+    - Показывает результаты скоринга из Postgres по кнопке «Посмотреть результаты».
 
 2. **`fraud_detector`** (ML Service):
    - Загружает предобученную модель CatBoost (`my_catboost.cbm`).
@@ -24,11 +25,19 @@ DISCLAIMER
      - Гео-расстояния
      - Кодирование категориальных переменных
    - Производит скоринг с порогом 0.98.
-   - Выгружает результат скоринга в топик kafka `scoring`
+   - Выгружает результат скоринга в топик kafka `scores`
 
-3. **Kafka Infrastructure**:
+3. **`scores_writer`** (Postgres Writer):
+   - Читает топик `scores`
+   - Складывает результаты (`transaction_id`, `score`, `fraud_flag`) в витрину `scores` в Postgres
+
+4. **Postgres**:
+   - Хранит витрину с результатами скоринга
+   - Схема создаётся автоматически при первом запуске
+
+5. **Kafka Infrastructure**:
    - Zookeeper + Kafka брокер
-   - `kafka-setup`: автоматически создает топики `transactions` и `scoring`
+   - `kafka-setup`: автоматически создает топики `transactions` и `scores`
    - Kafka UI: веб-интерфейс для мониторинга сообщений (порт 8080)
 
 ## 🚀 Быстрый старт
@@ -38,73 +47,137 @@ DISCLAIMER
 - Docker Compose 2.0+
 
 ### Запуск
+
 ```bash
-git clone https://github.com/your-repo/fraud-detection-system.git
-cd fraud-detection-system
+git clone <ссылка на репозиторий>
+cd mts-mlops-hw-1
 
 # Сборка и запуск всех сервисов
-docker-compose up --build
+docker compose up --build
 ```
+
+Скачивать датасеты и обучать модель не нужно: предобученная модель и таблицы
+препроцессинга уже лежат в репозитории.
+
 После запуска:
 - **Streamlit UI**: http://localhost:8501
 - **Kafka UI**: http://localhost:8080
-- **Логи сервисов**: 
+- **Логи сервисов**:
   ```bash
-  docker-compose logs <service_name>  # Например: fraud_detector, kafka, interface
+  docker compose logs <service_name>  # Например: fraud_detector, kafka, interface
+  ```
+
+Проверить, что все контейнеры поднялись:
+
+```bash
+docker compose ps
+```
 
 ## 🛠️ Использование
 
 ### 1. Загрузка данных:
 
- - Загрузите CSV через интерфейс Streamlit. Для тестирования работы проекта используется файл формата `test.csv` из соревнования https://www.kaggle.com/competitions/teta-ml-1-2025
- - Пример структуры данных:
+- Загрузите CSV через интерфейс Streamlit. Для тестирования работы проекта используется файл формата `test.csv` из соревнования https://www.kaggle.com/competitions/teta-ml-1-2025
+- Для быстрой проверки в репозитории есть готовый семпл `samples/test_sample.csv` (200 транзакций, среди них есть фродовые)
+- Пример структуры данных:
     ```csv
     transaction_time,amount,lat,lon,merchant_lat,merchant_lon,gender,...
     2023-01-01 12:30:00,150.50,40.7128,-74.0060,40.7580,-73.9855,M,...
     ```
- - Для первых тестов рекомендуется загружать небольшой семпл данных (до 100 транзакций) за раз, чтобы исполнение кода не заняло много времени.
+- Для первых тестов рекомендуется загружать небольшой семпл данных (до 100 транзакций) за раз, чтобы исполнение кода не заняло много времени.
 
 ### 2. Мониторинг:
- - **Kafka UI**: Просматривайте сообщения в топиках transactions и scoring
- - **Логи обработки**: /app/logs/service.log внутри контейнера fraud_detector
+- **Kafka UI**: Просматривайте сообщения в топиках transactions и scores
+- **Логи обработки**: `/app/logs/service.log` внутри контейнеров `fraud_detector` и `scores_writer`
 
 ### 3. Результаты:
 
- - Скоринговые оценки пишутся в топик scoring в формате:
+- Скоринговые оценки пишутся в топик scores в формате:
     ```json
     {
-    "score": 0.995, 
-    "fraud_flag": 1, 
-    "transaction_id": "d6b0f7a0-8e1a-4a3c-9b2d-5c8f9d1e2f3a"
+    "transaction_id": "d6b0f7a0-8e1a-4a3c-9b2d-5c8f9d1e2f3a",
+    "score": 0.995,
+    "fraud_flag": 1
     }
     ```
+- Сервис `scores_writer` складывает эти сообщения в таблицу `scores` в Postgres
+- В интерфейсе Streamlit по кнопке «Посмотреть результаты» выводятся:
+    1. 10 последних транзакций с флагом `fraud_flag == 1`
+    2. Гистограмма распределения скоров последних 100 транзакций
+
+Проверить содержимое витрины напрямую:
+
+```bash
+docker compose exec postgres psql -U fraud -d fraud -c "SELECT count(*) FROM scores;"
+docker compose exec postgres psql -U fraud -d fraud -c "SELECT * FROM scores ORDER BY id DESC LIMIT 5;"
+```
+
 ## Структура проекта
+
 ```
 .
-├── fraud_detector/
-│   ├── preprocessing.py    # Логика препроцессинга
-│   ├── scorer.py           # ML-модель и предсказания
-│   ├── app.py              # Kafka Consumer/Producer
+├── fraud_detector/           # ML-сервис: Kafka -> препроцессинг -> скоринг -> Kafka
+│   ├── app/app.py            # Kafka Consumer/Producer
+│   ├── src/preprocessing.py  # Логика препроцессинга
+│   ├── src/scorer.py         # ML-модель и предсказания
+│   ├── models/               # Модель и таблицы препроцессинга
 │   └── Dockerfile
-├── interface/
-│   └── app.py              # Streamlit UI
+├── scores_writer/            # Сервис записи результатов в Postgres
+│   ├── writer.py             # Kafka Consumer -> Postgres
+│   └── Dockerfile
+├── interface/                # Streamlit UI
+│   └── app.py
+├── postgres/init/            # SQL-схема витрины
+├── samples/                  # Пример данных для тестирования
+├── tools/                    # Скрипт сборки таблиц препроцессинга
 ├── docker-compose.yaml
 └── README.md
 ```
 
 ## Настройки Kafka
+
 ```yml
 Топики:
 - transactions (входные данные)
-- scoring (результаты скоринга)
+- scores (результаты скоринга)
 
 Репликация: 1 (для разработки)
 Партиции: 3
 ```
 
-*Примечание:* 
+## Настройки Postgres
+
+Параметры подключения задаются переменными окружения в `docker-compose.yaml`.
+Значения по умолчанию подходят для локального запуска, менять ничего не нужно.
+
+Чтобы задать свои значения, скопируйте `.env.example` в `.env`:
+
+```bash
+cp .env.example .env
+```
+
+| Переменная | Значение по умолчанию |
+|---|---|
+| `POSTGRES_DB` | `fraud` |
+| `POSTGRES_USER` | `fraud` |
+| `POSTGRES_PASSWORD` | `fraud` |
+
+*Примечание:*
 
 Для полной функциональности убедитесь, что:
-1. Модель `my_catboost.cbm` размещена в `fraud_detector/models/`
-2. Тренировочные данные находятся в `fraud_detector/train_data/`
-3. Порты 8080, 8501 и 9095 свободны на хосте
+1. Модель `my_catboost.cbm` и таблицы препроцессинга `encoders.json` размещены в `fraud_detector/models/`
+2. Порты 8080, 8501, 9095 и 5432 свободны на хосте
+
+## Препроцессинг
+
+Препроцессинг использует кодирование категориальных переменных средним значением
+целевой переменной. Таблицы кодирования строятся по соревновательному `train.csv`
+и лежат в `fraud_detector/models/encoders.json`, поэтому сам датасет для запуска
+сервиса не нужен.
+
+Если нужно пересобрать таблицы (например, на других данных), положите `train.csv`
+в директорию `teta-ml-1-2025/` и выполните:
+
+```bash
+python tools/build_encoders.py
+```
