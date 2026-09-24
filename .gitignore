@@ -11,3 +11,6 @@ venv/
 # Logs
 *.log
 logs/
+
+# Local environment overrides (.env.example is tracked)
+.env
