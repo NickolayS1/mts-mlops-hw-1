@@ -48,18 +48,13 @@ services:
       - ml-scorer
     restart: on-failure
     entrypoint: [ "/bin/bash", "-c" ]
-    command: |
-      echo 'Ожидание готовности Kafka...'
-      while ! kafka-topics --bootstrap-server kafka:9092 --list; do
-        sleep 1
-      done
-
-      echo 'Создание топиков...'
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
-      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 3 --replication-factor 1 --config retention.ms=604800000
-
-      echo 'Топики успешно созданы:'
-      kafka-topics --bootstrap-server kafka:9092 --list
+    command:
+      - |
+        echo 'Создание топиков...'
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic transactions --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic scores --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        echo 'Топики успешно созданы:'
+        kafka-topics --bootstrap-server kafka:9092 --list
   
   # Сервис для удобного просмотра топиков и настройки kafka
   kafka-ui:
