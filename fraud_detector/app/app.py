@@ -69,9 +69,14 @@ class ProcessingService:
                 submission['transaction_id'] = transaction_id
 
                 # Отправка результата в топик scores
+                result = {
+                    'transaction_id': transaction_id,
+                    'score': float(submission['score'].iloc[0]),
+                    'fraud_flag': int(submission['fraud_flag'].iloc[0])
+                }
                 self.producer.produce(
                     SCORING_TOPIC,
-                    value=submission.to_json(orient='records')
+                    value=json.dumps(result)
                 )
                 # Доставку сообщений выполняет librdkafka в фоне, чтобы не
                 # блокировать чтение следующего сообщения из Kafka
