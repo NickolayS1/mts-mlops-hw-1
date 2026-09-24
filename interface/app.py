@@ -1,3 +1,4 @@
+import numpy as np
 import streamlit as st
 import pandas as pd
 from kafka import KafkaProducer
@@ -5,11 +6,22 @@ import json
 import time
 import os
 import uuid
+from contextlib import closing
+import psycopg2
 
 # Конфигурация Kafka
 KAFKA_CONFIG = {
     "bootstrap_servers": os.getenv("KAFKA_BROKERS", "kafka:9092"),
     "topic": os.getenv("KAFKA_TOPIC", "transactions")
+}
+
+# Конфигурация Postgres
+POSTGRES_CONFIG = {
+    "host": os.getenv("POSTGRES_HOST", "postgres"),
+    "port": os.getenv("POSTGRES_PORT", "5432"),
+    "dbname": os.getenv("POSTGRES_DB", "fraud"),
+    "user": os.getenv("POSTGRES_USER", "fraud"),
+    "password": os.getenv("POSTGRES_PASSWORD", "fraud")
 }
 
 def load_file(uploaded_file):
@@ -19,6 +31,31 @@ def load_file(uploaded_file):
     except Exception as e:
         st.error(f"Ошибка загрузки файла: {str(e)}")
         return None
+
+
+def get_last_frauds(limit=10):
+    """Последние транзакции с флагом фрода."""
+    query = """
+        SELECT transaction_id, score, fraud_flag, created_at
+        FROM scores
+        WHERE fraud_flag = 1
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+    """
+    with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
+        return pd.read_sql_query(query, conn, params=(limit,))
+
+
+def get_last_scores(limit=100):
+    """Скоры последних транзакций для гистограммы."""
+    query = """
+        SELECT score
+        FROM scores
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s
+    """
+    with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
+        return pd.read_sql_query(query, conn, params=(limit,))
 
 def send_to_kafka(df, topic, bootstrap_servers):
     """Отправка данных в Kafka с уникальным ID транзакции"""
@@ -57,6 +94,9 @@ def send_to_kafka(df, topic, bootstrap_servers):
 # Инициализация состояния
 if "uploaded_files" not in st.session_state:
     st.session_state.uploaded_files = {}
+
+if "results" not in st.session_state:
+    st.session_state.results = None
 
 # Интерфейс
 st.title("📤 Отправка данных в Kafka")
@@ -100,3 +140,51 @@ if st.session_state.uploaded_files:
                             st.rerun()
                 else:
                     st.error("Файл не содержит данных")
+
+# Раздел с результатами скоринга
+st.divider()
+st.subheader("📊 Результаты скоринга")
+
+if st.button("Посмотреть результаты"):
+    try:
+        with st.spinner("Загрузка результатов..."):
+            # Сохраняем в состоянии сессии, чтобы данные не пропадали при перерисовке
+            st.session_state.results = {
+                "frauds": get_last_frauds(10),
+                "scores": get_last_scores(100)
+            }
+    except Exception as e:
+        st.session_state.results = None
+        st.error(f"Не удалось получить данные из Postgres: {str(e)}")
+
+if st.session_state.get("results"):
+    frauds = st.session_state.results["frauds"]
+    scores = st.session_state.results["scores"]
+
+    # 1. Последние транзакции с флагом фрода
+    st.markdown("**Последние 10 транзакций с флагом фрода**")
+
+    if frauds.empty:
+        st.info("Транзакции с флагом фрода не найдены.")
+    else:
+        display_df = frauds.copy()
+        display_df["created_at"] = pd.to_datetime(
+            display_df["created_at"]
+        ).dt.strftime("%Y-%m-%d %H:%M:%S")
+        display_df["score"] = display_df["score"].round(6)
+        display_df.columns = ["ID транзакции", "Скор", "Флаг фрода", "Время"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # 2. Распределение скоров последних транзакций
+    st.markdown("**Распределение скоров последних 100 транзакций**")
+
+    if scores.empty:
+        st.info("В базе пока нет транзакций.")
+    else:
+        st.caption(f"Транзакций в выборке: {len(scores)}")
+        hist, edges = np.histogram(scores["score"], bins=20, range=(0, 1))
+        chart_data = pd.DataFrame(
+            {"Скор": [f"{edges[i]:.2f}–{edges[i + 1]:.2f}" for i in range(len(hist))],
+             "Транзакций": hist}
+        ).set_index("Скор")
+        st.bar_chart(chart_data, color="#4C78A8")
