@@ -6,6 +6,7 @@ import json
 import time
 import os
 import uuid
+import threading
 from contextlib import closing
 import psycopg2
 
@@ -117,11 +118,37 @@ def humanize_age(seconds):
     return f"{seconds / 3600:.1f} ч назад"
 
 
-def send_to_kafka(df, topic, bootstrap_servers, delay=0.01):
-    """Отправка данных в Kafka с уникальным ID транзакции.
+# Состояние фоновых отправок. Общее для всех перерисовок скрипта,
+# поэтому хранится на уровне модуля, а не в session_state.
+_send_lock = threading.Lock()
+_send_state = {}
 
-    delay задаёт паузу между сообщениями: она нужна, чтобы поток был
-    наблюдаемым — иначе пачка уходит быстрее, чем её успеваешь увидеть.
+
+def get_send_state(file_name):
+    """Снимок прогресса отправки файла (или None, если отправка не запускалась)."""
+    with _send_lock:
+        state = _send_state.get(file_name)
+        return dict(state) if state else None
+
+
+def is_sending(file_name):
+    state = get_send_state(file_name)
+    return bool(state) and not state["done"]
+
+
+def any_sending():
+    """Идёт ли сейчас хоть одна отправка — по этому флагу обновляется раздел результатов."""
+    with _send_lock:
+        return any(not s["done"] for s in _send_state.values())
+
+
+def _send_worker(file_name, df, topic, bootstrap_servers, delay):
+    """Отправляет строки в Kafka в отдельном потоке.
+
+    Скрипт Streamlit выполняется сверху вниз в одном потоке: если слать
+    прямо в нём, страница замирает на всё время отправки и графики не
+    обновляются. Поэтому отправка вынесена в фоновый поток, а UI лишь
+    читает её прогресс.
     """
     try:
         producer = KafkaProducer(
@@ -129,32 +156,64 @@ def send_to_kafka(df, topic, bootstrap_servers, delay=0.01):
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
             security_protocol="PLAINTEXT"
         )
-        
-        # Генерация уникальных ID для всех транзакций
-        df['transaction_id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-        
-        progress_bar = st.progress(0)
-        total_rows = len(df)
-        
-        for idx, row in df.iterrows():
-            # Отправляем данные вместе с ID
+        total = len(df)
+        for idx, (_, row) in enumerate(df.iterrows()):
             producer.send(
-                topic, 
+                topic,
                 value={
-                    "transaction_id": row['transaction_id'],
-                    "data": row.drop('transaction_id').to_dict()
+                    "transaction_id": str(uuid.uuid4()),
+                    "data": row.to_dict(),
                 }
             )
-            progress_bar.progress((idx + 1) / total_rows)
+            with _send_lock:
+                _send_state[file_name]["sent"] = idx + 1
             if delay:
                 time.sleep(delay)
-            
         producer.flush()
-     
-        return True
+        with _send_lock:
+            _send_state[file_name]["done"] = True
     except Exception as e:
-        st.error(f"Ошибка отправки данных: {str(e)}")
-        return False
+        with _send_lock:
+            state = _send_state.setdefault(file_name, {"sent": 0, "total": len(df)})
+            state["error"] = str(e)
+            state["done"] = True
+
+
+def start_sending(file_name, df, topic, bootstrap_servers, delay):
+    """Запускает фоновую отправку, если она ещё не идёт."""
+    if is_sending(file_name):
+        return
+    with _send_lock:
+        _send_state[file_name] = {
+            "sent": 0, "total": len(df), "done": False, "error": None
+        }
+    # Новая отправка — файл снова «не завершён»
+    st.session_state.settled_sends.discard(file_name)
+    thread = threading.Thread(
+        target=_send_worker,
+        args=(file_name, df, topic, bootstrap_servers, delay),
+        daemon=True,
+    )
+    thread.start()
+
+
+def settle_finished_sends():
+    """Останавливает автообновление, когда отправка закончилась.
+
+    run_every фрагмента вычисляется в момент его создания, поэтому после
+    завершения отправки фрагмент продолжал бы перерисовываться каждую
+    секунду. Здесь мы один раз делаем полный прогон скрипта, чтобы
+    run_every пересчитался и стал None.
+
+    Вызывается из тела фрагментов: при их перерисовке скрипт целиком не
+    выполняется, поэтому проверку нужно делать именно там.
+    """
+    with _send_lock:
+        done = {name for name, s in _send_state.items() if s["done"]}
+    unsettled = done - st.session_state.settled_sends
+    if unsettled:
+        st.session_state.settled_sends |= unsettled
+        st.rerun(scope="app")
 
 # Инициализация состояния
 if "uploaded_files" not in st.session_state:
@@ -165,6 +224,13 @@ if "results_visible" not in st.session_state:
 
 if "confirm_reset" not in st.session_state:
     st.session_state.confirm_reset = False
+
+# Имена файлов, для которых автообновление уже остановлено
+if "settled_sends" not in st.session_state:
+    st.session_state.settled_sends = set()
+
+# Останавливаем автообновление, если фоновая отправка завершилась
+settle_finished_sends()
 
 # Интерфейс
 st.title("Скоринг транзакций")
@@ -201,28 +267,50 @@ if st.session_state.uploaded_files:
         help="Замедляет отправку, чтобы поток было видно в разделе результатов",
     )
 
-    for file_name, file_data in st.session_state.uploaded_files.items():
-        cols = st.columns([4, 2, 2])
-        
-        with cols[0]:
-            st.markdown(f"**Файл:** `{file_name}`")
-            st.markdown(f"**Статус:** `{file_data['status']}`")
-        
-        with cols[2]:
-            if st.button(f"Отправить {file_name}", key=f"send_{file_name}"):
-                if file_data["df"] is not None:
-                    with st.spinner("Отправка..."):
-                        success = send_to_kafka(
+    @st.fragment(run_every=1 if any_sending() else None)
+    def render_files():
+        """Список файлов и прогресс отправки. Пока идёт отправка, обновляется
+        раз в секунду — иначе полоса прогресса замирает на первом кадре."""
+        for file_name, file_data in st.session_state.uploaded_files.items():
+            cols = st.columns([4, 2, 2])
+
+            with cols[0]:
+                st.markdown(f"**Файл:** `{file_name}`")
+                st.markdown(f"**Статус:** `{file_data['status']}`")
+
+            with cols[2]:
+                if st.button(f"Отправить {file_name}", key=f"send_{file_name}"):
+                    if file_data["df"] is not None:
+                        # Отправка идёт в фоне, чтобы интерфейс не замирал
+                        start_sending(
+                            file_name,
                             file_data["df"],
                             KAFKA_CONFIG["topic"],
                             KAFKA_CONFIG["bootstrap_servers"],
                             delay=st.session_state.send_delay_ms / 1000.0,
                         )
-                        if success:
-                            st.session_state.uploaded_files[file_name]["status"] = "Отправлен"
-                            st.rerun()
+                        # Перерисовываем весь скрипт: run_every фрагментов
+                        # вычисляется только при полном прогоне
+                        st.rerun(scope="app")
+                    else:
+                        st.error("Файл не содержит данных")
+
+            state = get_send_state(file_name)
+            if state:
+                if state.get("error"):
+                    st.error(f"Ошибка отправки: {state['error']}")
                 else:
-                    st.error("Файл не содержит данных")
+                    sent, total = state["sent"], state["total"]
+                    st.progress(sent / total if total else 0.0)
+                    if state["done"]:
+                        st.caption(f"Отправлено {sent} из {total}")
+                    else:
+                        st.caption(f"Отправка... {sent} из {total}")
+
+        # Отправка закончилась — гасим автообновление фрагментов
+        settle_finished_sends()
+
+    render_files()
 
 
 # Раздел с результатами скоринга
@@ -333,12 +421,12 @@ def draw_results():
         st.bar_chart(chart_data, color="#3B6E8F")
 
 
-@st.fragment(run_every=2 if auto_refresh else None)
+@st.fragment(run_every=2 if (auto_refresh or any_sending()) else None)
 def results_fragment():
     """Фрагмент раздела результатов.
 
-    run_every берётся из переключателя: скрипт перерисовывается при каждом
-    изменении, поэтому декоратор применяется с актуальным значением.
+    Обновляется каждые 2 секунды, если включено автообновление или идёт
+    фоновая отправка — так график растёт прямо во время загрузки.
     """
     draw_results()
 
