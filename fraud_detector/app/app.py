@@ -1,10 +1,8 @@
 import os
 import sys
 import pandas as pd
-import time
 import logging
 import json
-from datetime import datetime
 
 from confluent_kafka import Consumer, Producer, KafkaError
 
