@@ -58,24 +58,59 @@ def get_last_scores(limit=100):
         return pd.read_sql_query(query, conn, params=(limit,))
 
 
+def get_recent_transactions(limit=15):
+    """Последние обработанные транзакции — чтобы видеть сам поток."""
+    query = """
+        SELECT created_at, transaction_id, score, fraud_flag
+        FROM scores
+        ORDER BY id DESC
+        LIMIT %s
+    """
+    with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
+        return pd.read_sql_query(query, conn, params=(limit,))
+
+
 def get_stats():
-    """Сводка по витрине: сколько всего записей, сколько фродов и скорость поступления."""
+    """Сводка по витрине: всего записей, фродов и как давно пришла последняя."""
     query = """
         SELECT
             count(*)                                                   AS total,
             sum(CASE WHEN fraud_flag = 1 THEN 1 ELSE 0 END)             AS frauds,
-            min(created_at)                                            AS first_at,
-            max(created_at)                                            AS last_at,
-            sum(CASE WHEN created_at > now() - interval '1 minute'
-                     THEN 1 ELSE 0 END)                                AS last_minute
+            extract(epoch FROM (now() - max(created_at)))               AS seconds_since_last
         FROM scores
     """
     with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
         return pd.read_sql_query(query, conn).iloc[0]
 
 
-def send_to_kafka(df, topic, bootstrap_servers):
-    """Отправка данных в Kafka с уникальным ID транзакции"""
+def fetch_results():
+    """Один заход в базу за всем, что нужно разделу результатов."""
+    return {
+        "stats": get_stats(),
+        "frauds": get_last_frauds(10),
+        "scores": get_last_scores(100),
+        "recent": get_recent_transactions(15),
+    }
+
+
+def humanize_age(seconds):
+    """«3 сек назад» вместо голого числа."""
+    if seconds is None or pd.isna(seconds):
+        return "—"
+    seconds = float(seconds)
+    if seconds < 60:
+        return f"{seconds:.0f} сек назад"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f} мин назад"
+    return f"{seconds / 3600:.1f} ч назад"
+
+
+def send_to_kafka(df, topic, bootstrap_servers, delay=0.01):
+    """Отправка данных в Kafka с уникальным ID транзакции.
+
+    delay задаёт паузу между сообщениями: она нужна, чтобы поток был
+    наблюдаемым — иначе пачка уходит быстрее, чем её успеваешь увидеть.
+    """
     try:
         producer = KafkaProducer(
             bootstrap_servers=bootstrap_servers,
@@ -99,7 +134,8 @@ def send_to_kafka(df, topic, bootstrap_servers):
                 }
             )
             progress_bar.progress((idx + 1) / total_rows)
-            time.sleep(0.01)
+            if delay:
+                time.sleep(delay)
             
         producer.flush()
      
@@ -116,11 +152,14 @@ if "results_visible" not in st.session_state:
     st.session_state.results_visible = False
 
 # Интерфейс
-st.title("📤 Отправка данных в Kafka")
+st.title("Скоринг транзакций")
+st.caption(
+    "Загруженные транзакции уходят в Kafka, оцениваются моделью и попадают в Postgres"
+)
 
 # Блок загрузки файлов
 uploaded_file = st.file_uploader(
-    "Загрузите CSV файл с транзакциями",
+    "CSV файл с транзакциями",
     type=["csv"]
 )
 
@@ -134,8 +173,19 @@ if uploaded_file and uploaded_file.name not in st.session_state.uploaded_files:
 
 # Список загруженных файлов
 if st.session_state.uploaded_files:
-    st.subheader("🗂 Список загруженных файлов")
-    
+    st.subheader("Загруженные файлы")
+
+    # Скорость отправки: без паузы пачка уходит быстрее, чем её можно увидеть
+    st.slider(
+        "Пауза между сообщениями, мс",
+        min_value=0,
+        max_value=200,
+        value=25,
+        step=5,
+        key="send_delay_ms",
+        help="Замедляет отправку, чтобы поток было видно в разделе результатов",
+    )
+
     for file_name, file_data in st.session_state.uploaded_files.items():
         cols = st.columns([4, 2, 2])
         
@@ -150,7 +200,8 @@ if st.session_state.uploaded_files:
                         success = send_to_kafka(
                             file_data["df"],
                             KAFKA_CONFIG["topic"],
-                            KAFKA_CONFIG["bootstrap_servers"]
+                            KAFKA_CONFIG["bootstrap_servers"],
+                            delay=st.session_state.send_delay_ms / 1000.0,
                         )
                         if success:
                             st.session_state.uploaded_files[file_name]["status"] = "Отправлен"
@@ -158,10 +209,13 @@ if st.session_state.uploaded_files:
                 else:
                     st.error("Файл не содержит данных")
 
+
 # Раздел с результатами скоринга
 st.divider()
-st.subheader("📊 Результаты скоринга")
+st.subheader("Результаты скоринга")
 
+# Управление объявлено до фрагмента: иначе значение переключателя
+# на момент создания фрагмента ещё неизвестно
 controls = st.columns([1, 1, 2])
 with controls[0]:
     show_results = st.button("Посмотреть результаты")
@@ -169,64 +223,87 @@ with controls[1]:
     auto_refresh = st.toggle(
         "Автообновление",
         key="auto_refresh",
-        help="Раз в 3 секунды подтягивать свежие результаты из базы",
+        help="Обновлять раздел каждые 2 секунды",
     )
 
 if show_results:
-    # Включаем отображение раздела
     st.session_state.results_visible = True
 
+
+def draw_results():
+    """Рисует сводку, ленту и графики по данным из Postgres."""
+    try:
+        data = fetch_results()
+    except Exception as e:
+        st.error(f"Не удалось получить данные из Postgres: {str(e)}")
+        return
+
+    stats, frauds, scores, recent = (
+        data["stats"], data["frauds"], data["scores"], data["recent"]
+    )
+
+    # Сводные метрики по витрине
+    metrics = st.columns(4)
+    metrics[0].metric("Всего транзакций", f"{int(stats['total']):,}")
+    metrics[1].metric("Фродовых транзакций", f"{int(stats['frauds']):,}")
+    if stats["total"]:
+        metrics[2].metric("Доля фрода", f"{100 * stats['frauds'] / stats['total']:.2f}%")
+    else:
+        metrics[2].metric("Доля фрода", "—")
+    metrics[3].metric("Последняя запись", humanize_age(stats["seconds_since_last"]))
+
+    # 1. Лента последних транзакций — по ней видно сам поток
+    st.markdown("**Последние обработанные транзакции**")
+
+    if recent.empty:
+        st.info("В базе пока нет транзакций.")
+    else:
+        feed = recent.copy()
+        feed["created_at"] = pd.to_datetime(feed["created_at"]).dt.strftime("%H:%M:%S")
+        feed["score"] = feed["score"].round(4)
+        feed["fraud_flag"] = feed["fraud_flag"].map({1: "фрод", 0: "норма"})
+        feed["transaction_id"] = feed["transaction_id"].str.slice(0, 8) + "…"
+        feed.columns = ["Время", "ID транзакции", "Вероятность", "Результат"]
+        st.dataframe(feed, use_container_width=True, hide_index=True)
+
+    # 2. Последние транзакции с флагом фрода
+    st.markdown("**Последние 10 фродовых транзакций**")
+
+    if frauds.empty:
+        st.info("Фродовых транзакций не найдено.")
+    else:
+        display_df = frauds.copy()
+        display_df["created_at"] = pd.to_datetime(
+            display_df["created_at"]
+        ).dt.strftime("%Y-%m-%d %H:%M:%S")
+        display_df["score"] = display_df["score"].round(6)
+        display_df.columns = ["ID транзакции", "Вероятность", "Фрод", "Время"]
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    # 3. Распределение вероятностей последних транзакций
+    st.markdown("**Распределение вероятностей последних 100 транзакций**")
+
+    if scores.empty:
+        st.info("В базе пока нет транзакций.")
+    else:
+        st.caption(f"Транзакций в выборке: {len(scores)}")
+        hist, edges = np.histogram(scores["score"], bins=20, range=(0, 1))
+        chart_data = pd.DataFrame(
+            {"Вероятность": [f"{edges[i]:.2f}–{edges[i + 1]:.2f}" for i in range(len(hist))],
+             "Транзакций": hist}
+        ).set_index("Вероятность")
+        st.bar_chart(chart_data, color="#3B6E8F")
+
+
+@st.fragment(run_every=2 if auto_refresh else None)
+def results_fragment():
+    """Фрагмент раздела результатов.
+
+    run_every берётся из переключателя: скрипт перерисовывается при каждом
+    изменении, поэтому декоратор применяется с актуальным значением.
+    """
+    draw_results()
+
+
 if st.session_state.get("results_visible"):
-
-    @st.fragment(run_every=3 if auto_refresh else None)
-    def render_results():
-        """Отрисовывает сводку и результаты; при автообновлении перечитывает базу."""
-        try:
-            stats = get_stats()
-            frauds = get_last_frauds(10)
-            scores = get_last_scores(100)
-        except Exception as e:
-            st.error(f"Не удалось получить данные из Postgres: {str(e)}")
-            return
-
-        # Сводные метрики по витрине
-        metrics = st.columns(4)
-        metrics[0].metric("Всего транзакций", f"{int(stats['total']):,}")
-        metrics[1].metric("Флагов фрода", f"{int(stats['frauds']):,}")
-        if stats["total"]:
-            metrics[2].metric(
-                "Доля фрода", f"{100 * stats['frauds'] / stats['total']:.2f}%"
-            )
-        else:
-            metrics[2].metric("Доля фрода", "—")
-        metrics[3].metric("За последнюю минуту", f"{int(stats['last_minute']):,}")
-
-        # 1. Последние транзакции с флагом фрода
-        st.markdown("**Последние 10 транзакций с флагом фрода**")
-
-        if frauds.empty:
-            st.info("Транзакции с флагом фрода не найдены.")
-        else:
-            display_df = frauds.copy()
-            display_df["created_at"] = pd.to_datetime(
-                display_df["created_at"]
-            ).dt.strftime("%Y-%m-%d %H:%M:%S")
-            display_df["score"] = display_df["score"].round(6)
-            display_df.columns = ["ID транзакции", "Скор", "Флаг фрода", "Время"]
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-        # 2. Распределение скоров последних транзакций
-        st.markdown("**Распределение скоров последних 100 транзакций**")
-
-        if scores.empty:
-            st.info("В базе пока нет транзакций.")
-        else:
-            st.caption(f"Транзакций в выборке: {len(scores)}")
-            hist, edges = np.histogram(scores["score"], bins=20, range=(0, 1))
-            chart_data = pd.DataFrame(
-                {"Скор": [f"{edges[i]:.2f}–{edges[i + 1]:.2f}" for i in range(len(hist))],
-                 "Транзакций": hist}
-            ).set_index("Скор")
-            st.bar_chart(chart_data, color="#4C78A8")
-
-    render_results()
+    results_fragment()

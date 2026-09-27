@@ -1,2 +1,10 @@
 [server]
 maxUploadSize = 500  # Максимальный размер файла в MB
+
+[theme]
+base = "light"
+primaryColor = "#3B6E8F"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F5F7"
+textColor = "#1B2733"
+font = "sans serif"
