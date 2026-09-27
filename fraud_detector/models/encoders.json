@@ -2474,6 +2474,8 @@
   "base_fraud_rate": 0.0057271394438927255,
   "earth_radius_km": 6371.009,
   "n_top_categories": 50,
-  "source_rows": 786431
+  "source_rows": 786431,
+  "valid_pr_auc": 0.9438968277284546,
+  "valid_roc_auc": 0.9985801871924151
  }
 }
