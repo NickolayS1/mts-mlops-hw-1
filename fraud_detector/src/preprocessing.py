@@ -12,7 +12,7 @@ from sklearn.impute import SimpleImputer
 logger = logging.getLogger(__name__)
 RANDOM_STATE = 42
 
-# Lookup tables derived from the competition train.csv by tools/build_encoders.py
+# Lookup tables built by training/train.py and stored next to the model
 ENCODERS_PATH = os.getenv('ENCODERS_PATH', './models/encoders.json')
 
 def add_time_features(df):

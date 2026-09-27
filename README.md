@@ -135,7 +135,6 @@ docker compose exec postgres psql -U fraud -d fraud -c "SELECT * FROM scores ORD
 │   └── README.md             # Метрики и детали обучения
 ├── postgres/init/            # SQL-схема витрины
 ├── samples/                  # Пример данных для тестирования
-├── tools/                    # Скрипт сборки таблиц препроцессинга
 ├── docker-compose.yaml
 └── README.md
 ```

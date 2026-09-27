@@ -5,7 +5,7 @@ from catboost import CatBoostClassifier
 # Настройка логгера
 logger = logging.getLogger(__name__)
 
-logger.info('Importing pretrained model...')
+logger.info('Importing model...')
 
 # Import model
 model = CatBoostClassifier()
