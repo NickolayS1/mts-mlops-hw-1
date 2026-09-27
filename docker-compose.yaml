@@ -58,7 +58,7 @@ services:
   
   # Сервис для удобного просмотра топиков и настройки kafka
   kafka-ui:
-    image: provectuslabs/kafka-ui:latest
+    image: provectuslabs/kafka-ui:v0.7.2
     restart: unless-stopped
     depends_on:
       - kafka
