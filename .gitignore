@@ -17,6 +17,3 @@ logs/
 
 # CatBoost training output
 catboost_info/
-
-# Kaggle submission produced by training/train.py
-training/submission.csv
