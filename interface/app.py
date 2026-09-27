@@ -71,12 +71,16 @@ def get_recent_transactions(limit=15):
 
 
 def get_stats():
-    """Сводка по витрине: всего записей, фродов и как давно пришла последняя."""
+    """Сводка по витрине: всего записей, фродов и как давно пришла последняя.
+
+    sum() по пустой таблице возвращает NULL, поэтому оборачиваем его в
+    coalesce — на пустой витрине нужен ноль, а не None.
+    """
     query = """
         SELECT
-            count(*)                                                   AS total,
-            sum(CASE WHEN fraud_flag = 1 THEN 1 ELSE 0 END)             AS frauds,
-            extract(epoch FROM (now() - max(created_at)))               AS seconds_since_last
+            count(*)                                                          AS total,
+            coalesce(sum(CASE WHEN fraud_flag = 1 THEN 1 ELSE 0 END), 0)       AS frauds,
+            extract(epoch FROM (now() - max(created_at)))                     AS seconds_since_last
         FROM scores
     """
     with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
