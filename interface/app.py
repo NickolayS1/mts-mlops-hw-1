@@ -57,6 +57,23 @@ def get_last_scores(limit=100):
     with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
         return pd.read_sql_query(query, conn, params=(limit,))
 
+
+def get_stats():
+    """Сводка по витрине: сколько всего записей, сколько фродов и скорость поступления."""
+    query = """
+        SELECT
+            count(*)                                                   AS total,
+            sum(CASE WHEN fraud_flag = 1 THEN 1 ELSE 0 END)             AS frauds,
+            min(created_at)                                            AS first_at,
+            max(created_at)                                            AS last_at,
+            sum(CASE WHEN created_at > now() - interval '1 minute'
+                     THEN 1 ELSE 0 END)                                AS last_minute
+        FROM scores
+    """
+    with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
+        return pd.read_sql_query(query, conn).iloc[0]
+
+
 def send_to_kafka(df, topic, bootstrap_servers):
     """Отправка данных в Kafka с уникальным ID транзакции"""
     try:
@@ -95,8 +112,8 @@ def send_to_kafka(df, topic, bootstrap_servers):
 if "uploaded_files" not in st.session_state:
     st.session_state.uploaded_files = {}
 
-if "results" not in st.session_state:
-    st.session_state.results = None
+if "results_visible" not in st.session_state:
+    st.session_state.results_visible = False
 
 # Интерфейс
 st.title("📤 Отправка данных в Kafka")
@@ -145,46 +162,71 @@ if st.session_state.uploaded_files:
 st.divider()
 st.subheader("📊 Результаты скоринга")
 
-if st.button("Посмотреть результаты"):
-    try:
-        with st.spinner("Загрузка результатов..."):
-            # Сохраняем в состоянии сессии, чтобы данные не пропадали при перерисовке
-            st.session_state.results = {
-                "frauds": get_last_frauds(10),
-                "scores": get_last_scores(100)
-            }
-    except Exception as e:
-        st.session_state.results = None
-        st.error(f"Не удалось получить данные из Postgres: {str(e)}")
+controls = st.columns([1, 1, 2])
+with controls[0]:
+    show_results = st.button("Посмотреть результаты")
+with controls[1]:
+    auto_refresh = st.toggle(
+        "Автообновление",
+        key="auto_refresh",
+        help="Раз в 3 секунды подтягивать свежие результаты из базы",
+    )
 
-if st.session_state.get("results"):
-    frauds = st.session_state.results["frauds"]
-    scores = st.session_state.results["scores"]
+if show_results:
+    # Включаем отображение раздела
+    st.session_state.results_visible = True
 
-    # 1. Последние транзакции с флагом фрода
-    st.markdown("**Последние 10 транзакций с флагом фрода**")
+if st.session_state.get("results_visible"):
 
-    if frauds.empty:
-        st.info("Транзакции с флагом фрода не найдены.")
-    else:
-        display_df = frauds.copy()
-        display_df["created_at"] = pd.to_datetime(
-            display_df["created_at"]
-        ).dt.strftime("%Y-%m-%d %H:%M:%S")
-        display_df["score"] = display_df["score"].round(6)
-        display_df.columns = ["ID транзакции", "Скор", "Флаг фрода", "Время"]
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    @st.fragment(run_every=3 if auto_refresh else None)
+    def render_results():
+        """Отрисовывает сводку и результаты; при автообновлении перечитывает базу."""
+        try:
+            stats = get_stats()
+            frauds = get_last_frauds(10)
+            scores = get_last_scores(100)
+        except Exception as e:
+            st.error(f"Не удалось получить данные из Postgres: {str(e)}")
+            return
 
-    # 2. Распределение скоров последних транзакций
-    st.markdown("**Распределение скоров последних 100 транзакций**")
+        # Сводные метрики по витрине
+        metrics = st.columns(4)
+        metrics[0].metric("Всего транзакций", f"{int(stats['total']):,}")
+        metrics[1].metric("Флагов фрода", f"{int(stats['frauds']):,}")
+        if stats["total"]:
+            metrics[2].metric(
+                "Доля фрода", f"{100 * stats['frauds'] / stats['total']:.2f}%"
+            )
+        else:
+            metrics[2].metric("Доля фрода", "—")
+        metrics[3].metric("За последнюю минуту", f"{int(stats['last_minute']):,}")
 
-    if scores.empty:
-        st.info("В базе пока нет транзакций.")
-    else:
-        st.caption(f"Транзакций в выборке: {len(scores)}")
-        hist, edges = np.histogram(scores["score"], bins=20, range=(0, 1))
-        chart_data = pd.DataFrame(
-            {"Скор": [f"{edges[i]:.2f}–{edges[i + 1]:.2f}" for i in range(len(hist))],
-             "Транзакций": hist}
-        ).set_index("Скор")
-        st.bar_chart(chart_data, color="#4C78A8")
+        # 1. Последние транзакции с флагом фрода
+        st.markdown("**Последние 10 транзакций с флагом фрода**")
+
+        if frauds.empty:
+            st.info("Транзакции с флагом фрода не найдены.")
+        else:
+            display_df = frauds.copy()
+            display_df["created_at"] = pd.to_datetime(
+                display_df["created_at"]
+            ).dt.strftime("%Y-%m-%d %H:%M:%S")
+            display_df["score"] = display_df["score"].round(6)
+            display_df.columns = ["ID транзакции", "Скор", "Флаг фрода", "Время"]
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+        # 2. Распределение скоров последних транзакций
+        st.markdown("**Распределение скоров последних 100 транзакций**")
+
+        if scores.empty:
+            st.info("В базе пока нет транзакций.")
+        else:
+            st.caption(f"Транзакций в выборке: {len(scores)}")
+            hist, edges = np.histogram(scores["score"], bins=20, range=(0, 1))
+            chart_data = pd.DataFrame(
+                {"Скор": [f"{edges[i]:.2f}–{edges[i + 1]:.2f}" for i in range(len(hist))],
+                 "Транзакций": hist}
+            ).set_index("Скор")
+            st.bar_chart(chart_data, color="#4C78A8")
+
+    render_results()
