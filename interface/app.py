@@ -93,6 +93,14 @@ def fetch_results():
     }
 
 
+def clear_scores():
+    """Очищает витрину, чтобы начать наблюдение с чистого листа."""
+    with closing(psycopg2.connect(**POSTGRES_CONFIG)) as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE scores RESTART IDENTITY")
+        conn.commit()
+
+
 def humanize_age(seconds):
     """«3 сек назад» вместо голого числа."""
     if seconds is None or pd.isna(seconds):
@@ -150,6 +158,9 @@ if "uploaded_files" not in st.session_state:
 
 if "results_visible" not in st.session_state:
     st.session_state.results_visible = False
+
+if "confirm_reset" not in st.session_state:
+    st.session_state.confirm_reset = False
 
 # Интерфейс
 st.title("Скоринг транзакций")
@@ -216,7 +227,7 @@ st.subheader("Результаты скоринга")
 
 # Управление объявлено до фрагмента: иначе значение переключателя
 # на момент создания фрагмента ещё неизвестно
-controls = st.columns([1, 1, 2])
+controls = st.columns([1, 1, 1, 2])
 with controls[0]:
     show_results = st.button("Посмотреть результаты")
 with controls[1]:
@@ -225,9 +236,32 @@ with controls[1]:
         key="auto_refresh",
         help="Обновлять раздел каждые 2 секунды",
     )
+with controls[2]:
+    reset_clicked = st.button("Очистить историю")
 
 if show_results:
     st.session_state.results_visible = True
+
+# Очистка подтверждается вторым нажатием, чтобы не стереть данные случайно
+if reset_clicked:
+    st.session_state.confirm_reset = True
+
+if st.session_state.get("confirm_reset"):
+    st.warning("Удалить все записи из витрины? Действие необратимо.")
+    confirm_cols = st.columns([1, 1, 4])
+    with confirm_cols[0]:
+        if st.button("Да, удалить", type="primary"):
+            try:
+                clear_scores()
+                st.session_state.confirm_reset = False
+                st.success("История очищена.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Не удалось очистить историю: {str(e)}")
+    with confirm_cols[1]:
+        if st.button("Отмена"):
+            st.session_state.confirm_reset = False
+            st.rerun()
 
 
 def draw_results():
