@@ -46,6 +46,11 @@ N_TOP_CATEGORIES = 50
 N_FOLDS = 5
 EARTH_RADIUS_KM = 6371.009
 
+# Порог перевода вероятности в метку для сабмита.
+# Метрика соревнования принимает бинарные метки, а не вероятности.
+# Значение выбрано по валидации: максимум F1 (см. вывод в ячейке 6.5).
+SUBMISSION_THRESHOLD = 0.3
+
 # %% [markdown]
 # ## 2. Загрузка данных
 
@@ -311,6 +316,8 @@ def main():
     print(f"saved encoders -> {OUT_ENCODERS}")
 
     # --- 6.8. Сабмит для Kaggle ---
+    # Метрика соревнования работает с бинарными метками, поэтому вероятности
+    # переводим в 0/1 по порогу, подобранному на валидации (см. ячейку 6.5).
     if os.path.exists(TEST_PATH):
         raw_test = load_raw(TEST_PATH)
         test_df = build_test_frame(raw_test, maps)
@@ -319,10 +326,14 @@ def main():
         for c in time_keys + cat_keys:
             X_test[c] = X_test[c].astype(str)
         test_proba = final_model.predict_proba(X_test)[:, 1]
-        submission = pd.DataFrame({"index": np.arange(len(test_proba)),
-                                   "prediction": test_proba})
-        submission.to_csv(OUT_SUBMISSION, index=False)
-        print(f"saved submission -> {OUT_SUBMISSION} ({len(submission)} rows)")
+        submission = pd.DataFrame({
+            "index": np.arange(len(test_proba), dtype="int64"),
+            "prediction": (test_proba > SUBMISSION_THRESHOLD).astype("int64"),
+        })
+        # Разделитель строк — LF и никакого \r: так же, как в sample_submition.csv
+        submission.to_csv(OUT_SUBMISSION, index=False, lineterminator="\n")
+        print(f"saved submission -> {OUT_SUBMISSION} ({len(submission)} rows, "
+              f"{int(submission['prediction'].sum())} positives)")
 
     print(f"\ndone in {time.time() - started:.1f}s")
 
