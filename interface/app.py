@@ -319,9 +319,9 @@ st.subheader("Результаты скоринга")
 
 # Управление объявлено до фрагмента: иначе значение переключателя
 # на момент создания фрагмента ещё неизвестно
-controls = st.columns([1, 1, 1, 2])
+controls = st.columns([1.6, 1.6, 1.4, 2])
 with controls[0]:
-    show_results = st.button("Посмотреть результаты")
+    show_results = st.button("Посмотреть результаты", use_container_width=True)
 with controls[1]:
     auto_refresh = st.toggle(
         "Автообновление",
@@ -329,7 +329,7 @@ with controls[1]:
         help="Обновлять раздел каждые 2 секунды",
     )
 with controls[2]:
-    reset_clicked = st.button("Очистить историю")
+    reset_clicked = st.button("Очистить историю", use_container_width=True)
 
 if show_results:
     st.session_state.results_visible = True
